@@ -1,10 +1,22 @@
-name: Generate Daily Feed
+name: Generate Feeds
 
 on:
   schedule:
-    # Run every 6 hours to keep the feed fresh
+    # Tweets: every 6 hours
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Allow manual trigger from GitHub UI
+    # Podcasts: once daily at 6am UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'What to fetch'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - tweets-only
+          - podcasts-only
 
 jobs:
   generate:
@@ -22,16 +34,30 @@ jobs:
       - name: Install dependencies
         run: cd scripts && npm install
 
+      - name: Determine mode
+        id: mode
+        run: |
+          # Manual trigger uses the input
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "flag=${{ inputs.mode == 'tweets-only' && '--tweets-only' || inputs.mode == 'podcasts-only' && '--podcasts-only' || '' }}" >> $GITHUB_OUTPUT
+          # The 6am UTC cron runs both (it's the daily podcast run)
+          elif [ "$(date -u +%H)" = "06" ]; then
+            echo "flag=" >> $GITHUB_OUTPUT
+          # All other cron runs are tweets-only
+          else
+            echo "flag=--tweets-only" >> $GITHUB_OUTPUT
+          fi
+
       - name: Generate feed
         env:
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
           SUPADATA_API_KEY: ${{ secrets.SUPADATA_API_KEY }}
-        run: cd scripts && node generate-feed.js
+        run: cd scripts && node generate-feed.js ${{ steps.mode.outputs.flag }}
 
       - name: Commit and push feeds
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add feed-x.json feed-podcasts.json
+          git add feed-x.json feed-podcasts.json state-feed.json
           git diff --cached --quiet || git commit -m "chore: update feeds [skip ci]"
           git push

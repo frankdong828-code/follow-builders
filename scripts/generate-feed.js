@@ -3,22 +3,17 @@
 // ============================================================================
 // Follow Builders — Central Feed Generator
 // ============================================================================
-// Runs daily (via GitHub Actions) to fetch content from all sources and
-// publish a single feed.json that any user's agent can consume.
+// Runs on GitHub Actions (every 6h for tweets, every 24h for podcasts) to
+// fetch content and publish feed-x.json and feed-podcasts.json.
 //
-// This means users need ZERO API keys — all fetching is done centrally.
+// Deduplication: tracks previously seen tweet IDs and video IDs in
+// state-feed.json so content is never repeated across runs.
 //
-// Sources:
-//   - X/Twitter: Official API v2 (paid by the skill maintainer)
-//   - YouTube: Supadata API (paid by the skill maintainer)
-//
-// Output: feed.json with all content, ready for agents to remix
-//
-// Usage: node generate-feed.js
+// Usage: node generate-feed.js [--tweets-only | --podcasts-only]
 // Env vars needed: X_BEARER_TOKEN, SUPADATA_API_KEY
 // ============================================================================
 
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 
@@ -26,24 +21,52 @@ import { join } from 'path';
 
 const SUPADATA_BASE = 'https://api.supadata.ai/v1';
 const X_API_BASE = 'https://api.x.com/2';
-
-// How far back to look for content
 const LOOKBACK_HOURS = 24;
+const MAX_TWEETS_PER_USER = 3;
+
+// State file lives in the repo root so it gets committed by GitHub Actions
+const SCRIPT_DIR = decodeURIComponent(new URL('.', import.meta.url).pathname);
+const STATE_PATH = join(SCRIPT_DIR, '..', 'state-feed.json');
+
+// -- State Management --------------------------------------------------------
+
+// Tracks which tweet IDs and video IDs we've already included in feeds
+// so we never send the same content twice across runs.
+
+async function loadState() {
+  if (!existsSync(STATE_PATH)) {
+    return { seenTweets: {}, seenVideos: {} };
+  }
+  try {
+    return JSON.parse(await readFile(STATE_PATH, 'utf-8'));
+  } catch {
+    return { seenTweets: {}, seenVideos: {} };
+  }
+}
+
+async function saveState(state) {
+  // Prune entries older than 7 days to prevent the file from growing forever
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  for (const [id, ts] of Object.entries(state.seenTweets)) {
+    if (ts < cutoff) delete state.seenTweets[id];
+  }
+  for (const [id, ts] of Object.entries(state.seenVideos)) {
+    if (ts < cutoff) delete state.seenVideos[id];
+  }
+  await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
+}
 
 // -- Load Sources ------------------------------------------------------------
 
 async function loadSources() {
-  const scriptDir = decodeURIComponent(new URL('.', import.meta.url).pathname);
-  const sourcesPath = join(scriptDir, '..', 'config', 'default-sources.json');
+  const sourcesPath = join(SCRIPT_DIR, '..', 'config', 'default-sources.json');
   return JSON.parse(await readFile(sourcesPath, 'utf-8'));
 }
 
 // -- YouTube Fetching (Supadata API) -----------------------------------------
 
-async function fetchYouTubeContent(podcasts, apiKey, errors) {
+async function fetchYouTubeContent(podcasts, apiKey, state, errors) {
   const cutoff = new Date(Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000);
-
-  // Phase 1: Collect candidates with metadata (no transcripts yet)
   const allCandidates = [];
 
   for (const podcast of podcasts) {
@@ -67,8 +90,10 @@ async function fetchYouTubeContent(podcasts, apiKey, errors) {
       const videosData = await videosRes.json();
       const videoIds = videosData.videoIds || videosData.video_ids || [];
 
-      // Check the first 2 videos per channel for metadata
+      // Check first 2 videos per channel, skip already-seen ones
       for (const videoId of videoIds.slice(0, 2)) {
+        if (state.seenVideos[videoId]) continue; // dedup
+
         try {
           const metaRes = await fetch(
             `${SUPADATA_BASE}/youtube/video?id=${videoId}`,
@@ -79,10 +104,8 @@ async function fetchYouTubeContent(podcasts, apiKey, errors) {
           const publishedAt = meta.uploadDate || meta.publishedAt || meta.date || null;
 
           allCandidates.push({
-            podcast,
-            videoId,
+            podcast, videoId,
             title: meta.title || 'Untitled',
-            description: meta.description || '',
             publishedAt
           });
           await new Promise(r => setTimeout(r, 300));
@@ -95,17 +118,15 @@ async function fetchYouTubeContent(podcasts, apiKey, errors) {
     }
   }
 
-  // Phase 2: Pick the 1 most recent video and fetch its transcript
-  // Only 1 per day to keep token costs low for users
+  // Pick the 1 most recent video within 24h
   const sorted = allCandidates
     .filter(v => v.publishedAt)
     .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
 
-  let selected = sorted.find(v => new Date(v.publishedAt) >= cutoff);
-  if (!selected && sorted.length > 0) selected = sorted[0];
+  const selected = sorted.find(v => new Date(v.publishedAt) >= cutoff);
   if (!selected) return [];
 
-  // Fetch transcript centrally so users don't need a Supadata key
+  // Fetch transcript
   try {
     const videoUrl = `https://www.youtube.com/watch?v=${selected.videoId}`;
     const transcriptRes = await fetch(
@@ -119,6 +140,9 @@ async function fetchYouTubeContent(podcasts, apiKey, errors) {
     }
 
     const transcriptData = await transcriptRes.json();
+
+    // Mark as seen
+    state.seenVideos[selected.videoId] = Date.now();
 
     return [{
       source: 'podcast',
@@ -137,19 +161,14 @@ async function fetchYouTubeContent(podcasts, apiKey, errors) {
 
 // -- X/Twitter Fetching (Official API v2) ------------------------------------
 
-async function fetchXContent(xAccounts, bearerToken, errors) {
+async function fetchXContent(xAccounts, bearerToken, state, errors) {
   const results = [];
   const cutoff = new Date(Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000);
 
-  // Step 1: Look up all user IDs in a single batch (up to 100 usernames)
-  // This uses 1 API call instead of 32
+  // Batch lookup all user IDs (1 API call)
   const handles = xAccounts.map(a => a.handle);
-  const handleToName = {};
-  xAccounts.forEach(a => { handleToName[a.handle.toLowerCase()] = a.name; });
+  let userMap = {};
 
-  let userMap = {}; // handle -> userId
-
-  // X API allows up to 100 usernames per lookup
   for (let i = 0; i < handles.length; i += 100) {
     const batch = handles.slice(i, i + 100);
     try {
@@ -171,8 +190,6 @@ async function fetchXContent(xAccounts, bearerToken, errors) {
           description: user.description || ''
         };
       }
-
-      // Log any users not found
       if (data.errors) {
         for (const err of data.errors) {
           errors.push(`X API: User not found: ${err.value || err.detail}`);
@@ -183,7 +200,7 @@ async function fetchXContent(xAccounts, bearerToken, errors) {
     }
   }
 
-  // Step 2: Fetch recent tweets for each user
+  // Fetch recent tweets per user (max 3, exclude retweets/replies)
   for (const account of xAccounts) {
     const userData = userMap[account.handle.toLowerCase()];
     if (!userData) continue;
@@ -191,15 +208,14 @@ async function fetchXContent(xAccounts, bearerToken, errors) {
     try {
       const res = await fetch(
         `${X_API_BASE}/users/${userData.id}/tweets?` +
-        `max_results=10` +
-        `&tweet.fields=created_at,public_metrics,referenced_tweets,entities` +
+        `max_results=5` +       // fetch 5, then filter to 3 new ones
+        `&tweet.fields=created_at,public_metrics,referenced_tweets` +
         `&exclude=retweets,replies` +
         `&start_time=${cutoff.toISOString()}`,
         { headers: { 'Authorization': `Bearer ${bearerToken}` } }
       );
 
       if (!res.ok) {
-        // 429 = rate limited, back off
         if (res.status === 429) {
           errors.push(`X API: Rate limited, skipping remaining accounts`);
           break;
@@ -209,17 +225,15 @@ async function fetchXContent(xAccounts, bearerToken, errors) {
       }
 
       const data = await res.json();
-      const tweets = data.data || [];
+      const allTweets = data.data || [];
 
-      if (tweets.length === 0) continue;
+      // Filter out already-seen tweets, cap at 3
+      const newTweets = [];
+      for (const t of allTweets) {
+        if (state.seenTweets[t.id]) continue; // dedup
+        if (newTweets.length >= MAX_TWEETS_PER_USER) break;
 
-      results.push({
-        source: 'x',
-        name: account.name,
-        handle: account.handle,
-        // Include the user's current bio so agents can describe them accurately
-        bio: userData.description,
-        tweets: tweets.map(t => ({
+        newTweets.push({
           id: t.id,
           text: t.text,
           createdAt: t.created_at,
@@ -227,13 +241,24 @@ async function fetchXContent(xAccounts, bearerToken, errors) {
           likes: t.public_metrics?.like_count || 0,
           retweets: t.public_metrics?.retweet_count || 0,
           replies: t.public_metrics?.reply_count || 0,
-          // If this is a quote tweet, note what it's quoting
           isQuote: t.referenced_tweets?.some(r => r.type === 'quoted') || false,
           quotedTweetId: t.referenced_tweets?.find(r => r.type === 'quoted')?.id || null
-        }))
+        });
+
+        // Mark as seen
+        state.seenTweets[t.id] = Date.now();
+      }
+
+      if (newTweets.length === 0) continue;
+
+      results.push({
+        source: 'x',
+        name: account.name,
+        handle: account.handle,
+        bio: userData.description,
+        tweets: newTweets
       });
 
-      // Small delay to respect rate limits
       await new Promise(r => setTimeout(r, 200));
     } catch (err) {
       errors.push(`X API: Error fetching @${account.handle}: ${err.message}`);
@@ -246,64 +271,68 @@ async function fetchXContent(xAccounts, bearerToken, errors) {
 // -- Main --------------------------------------------------------------------
 
 async function main() {
+  const args = process.argv.slice(2);
+  const tweetsOnly = args.includes('--tweets-only');
+  const podcastsOnly = args.includes('--podcasts-only');
+
   const xBearerToken = process.env.X_BEARER_TOKEN;
   const supadataKey = process.env.SUPADATA_API_KEY;
 
-  if (!xBearerToken) {
-    console.error('X_BEARER_TOKEN not set');
+  if (!tweetsOnly && !supadataKey) {
+    console.error('SUPADATA_API_KEY not set');
     process.exit(1);
   }
-  if (!supadataKey) {
-    console.error('SUPADATA_API_KEY not set');
+  if (!podcastsOnly && !xBearerToken) {
+    console.error('X_BEARER_TOKEN not set');
     process.exit(1);
   }
 
   const sources = await loadSources();
+  const state = await loadState();
   const errors = [];
 
-  console.error('Fetching YouTube content...');
-  const podcasts = await fetchYouTubeContent(sources.podcasts, supadataKey, errors);
-  console.error(`  Found ${podcasts.length} new episodes`);
+  // Fetch tweets (unless --podcasts-only)
+  let xContent = [];
+  if (!podcastsOnly) {
+    console.error('Fetching X/Twitter content...');
+    xContent = await fetchXContent(sources.x_accounts, xBearerToken, state, errors);
+    console.error(`  Found ${xContent.length} builders with new tweets`);
 
-  console.error('Fetching X/Twitter content...');
-  const xContent = await fetchXContent(sources.x_accounts, xBearerToken, errors);
-  console.error(`  Found ${xContent.length} builders with new tweets`);
+    const totalTweets = xContent.reduce((sum, a) => sum + a.tweets.length, 0);
+    const xFeed = {
+      generatedAt: new Date().toISOString(),
+      lookbackHours: LOOKBACK_HOURS,
+      x: xContent,
+      stats: { xBuilders: xContent.length, totalTweets },
+      errors: errors.filter(e => e.startsWith('X API')).length > 0
+        ? errors.filter(e => e.startsWith('X API')) : undefined
+    };
+    await writeFile(join(SCRIPT_DIR, '..', 'feed-x.json'), JSON.stringify(xFeed, null, 2));
+    console.error(`  feed-x.json: ${xContent.length} builders, ${totalTweets} tweets`);
+  }
 
-  const scriptDir = decodeURIComponent(new URL('.', import.meta.url).pathname);
-  const totalTweets = xContent.reduce((sum, a) => sum + a.tweets.length, 0);
+  // Fetch podcasts (unless --tweets-only)
+  let podcasts = [];
+  if (!tweetsOnly) {
+    console.error('Fetching YouTube content...');
+    podcasts = await fetchYouTubeContent(sources.podcasts, supadataKey, state, errors);
+    console.error(`  Found ${podcasts.length} new episodes`);
 
-  // Write two separate feeds
-  const xFeed = {
-    generatedAt: new Date().toISOString(),
-    lookbackHours: LOOKBACK_HOURS,
-    x: xContent,
-    stats: {
-      xBuilders: xContent.length,
-      totalTweets
-    },
-    errors: errors.filter(e => e.startsWith('X API')).length > 0
-      ? errors.filter(e => e.startsWith('X API'))
-      : undefined
-  };
+    const podcastFeed = {
+      generatedAt: new Date().toISOString(),
+      lookbackHours: LOOKBACK_HOURS,
+      podcasts,
+      stats: { podcastEpisodes: podcasts.length },
+      errors: errors.filter(e => e.startsWith('YouTube')).length > 0
+        ? errors.filter(e => e.startsWith('YouTube')) : undefined
+    };
+    await writeFile(join(SCRIPT_DIR, '..', 'feed-podcasts.json'), JSON.stringify(podcastFeed, null, 2));
+    console.error(`  feed-podcasts.json: ${podcasts.length} episodes`);
+  }
 
-  const podcastFeed = {
-    generatedAt: new Date().toISOString(),
-    lookbackHours: LOOKBACK_HOURS,
-    podcasts,
-    stats: {
-      podcastEpisodes: podcasts.length
-    },
-    errors: errors.filter(e => e.startsWith('YouTube')).length > 0
-      ? errors.filter(e => e.startsWith('YouTube'))
-      : undefined
-  };
+  // Save dedup state
+  await saveState(state);
 
-  await writeFile(join(scriptDir, '..', 'feed-x.json'), JSON.stringify(xFeed, null, 2));
-  await writeFile(join(scriptDir, '..', 'feed-podcasts.json'), JSON.stringify(podcastFeed, null, 2));
-
-  console.error(`\nFeeds written:`);
-  console.error(`  feed-x.json: ${xContent.length} builders, ${totalTweets} tweets`);
-  console.error(`  feed-podcasts.json: ${podcasts.length} episodes`);
   if (errors.length > 0) {
     console.error(`  ${errors.length} non-fatal errors`);
   }
