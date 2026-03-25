@@ -20,7 +20,7 @@ import { join } from 'path';
 // -- Constants ---------------------------------------------------------------
 
 const SUPADATA_BASE = 'https://api.supadata.ai/v1';
-const X_API_BASE = 'https://api.x.com/2';
+const X_API_BASE = 'https://api.twitter.com/2';
 const TWEET_LOOKBACK_HOURS = 24;
 const PODCAST_LOOKBACK_HOURS = 72;
 const MAX_TWEETS_PER_USER = 3;
@@ -182,7 +182,7 @@ async function fetchXContent(xAccounts, bearerToken, state, errors) {
       );
 
       if (!res.ok) {
-        errors.push(`X API: User lookup failed: HTTP ${res.status}`);
+        const body = await res.text(); errors.push(`X API: User lookup failed: HTTP ${res.status} body=${body.substring(0,200)}`);
         continue;
       }
 
