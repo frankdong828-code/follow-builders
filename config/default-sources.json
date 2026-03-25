@@ -29,6 +29,12 @@
       "type": "youtube_channel",
       "url": "https://www.youtube.com/@DataDrivenNYC/videos",
       "channelHandle": "DataDrivenNYC"
+    },
+    {
+      "name": "GTMnow",
+      "type": "youtube_channel",
+      "url": "https://www.youtube.com/@gtm_now",
+      "channelHandle": "gtm_now"
     }
   ],
   "x_accounts": [
@@ -56,6 +62,18 @@
     { "name": "Dan Shipper", "handle": "danshipper" },
     { "name": "Aditya Agarwal", "handle": "adityaag" },
     { "name": "Sam Altman", "handle": "sama" },
-    { "name": "Claude", "handle": "claudeai" }
+    { "name": "Claude", "handle": "claudeai" },
+    { "name": "Max Altschuler", "handle": "HackItMax", "tags": ["GTM", "RevOps"] },
+    { "name": "Matthew Volm", "handle": "matthewvolm", "tags": ["RevOps", "GTM"] },
+    { "name": "Varun Anand", "handle": "vxanand", "tags": ["GTM", "Clay"] },
+    { "name": "Shreyas Doshi", "handle": "shreyas", "tags": ["Product", "GTM"] },
+    { "name": "Sangram Vajre", "handle": "sangramvajre", "tags": ["ABM", "GTM"] },
+    { "name": "Dave Gerhardt", "handle": "davegerhardt", "tags": ["B2B", "Marketing"] },
+    { "name": "Rosalyn Santa Elena", "handle": "rosalynse", "tags": ["RevOps"] },
+    { "name": "Jason Lemkin", "handle": "jasonlemkin", "tags": ["SaaS", "GTM"] },
+    { "name": "Mr Daï", "handle": "mrdaoof", "tags": ["GTM Engineer"] },
+    { "name": "Jeff Ignacio", "handle": "jeffbethechange", "tags": ["RevOps"] },
+    { "name": "Tammy Sexton", "handle": "tsextonCRO", "tags": ["CRO", "GTM"] },
+    { "name": "Aditya Agarwal", "handle": "adityaag", "tags": ["GTM", "SaaS"] }
   ]
 }
